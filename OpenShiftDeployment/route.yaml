@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Route
+metadata:
+  name: openshifttestapp-application-route
+spec:
+  to:
+    kind: Service
+    name: openshifttestapp-application-service

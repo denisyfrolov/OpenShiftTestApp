@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: openshifttestapp-application-service
+spec:
+  selector:
+    app: OpenShiftTestApp
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openshifttestapp-database-service
+spec:
+  selector:
+    app: OpenShiftTestApp
+  ports:
+    - protocol: TCP
+      port: 31433
+      targetPort: 1433
+  type: LoadBalancer

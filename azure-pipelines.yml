@@ -1,0 +1,235 @@
+trigger:
+- master
+
+resources:
+- repo: self
+
+variables:
+  tag: '$(Build.BuildId)'
+  REGISTRY_HOSTNAME: $(REGISTRY_NAME).azurecr.io
+
+stages:
+- stage: Build
+  jobs:  
+  - job: Build
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: Bash@3
+      displayName: Setup Env
+      inputs:
+        targetType: 'inline'
+        script: |
+          sed -i "s/#{Build.BuildId}#/$BUILDID/g" deployment.yaml
+        workingDirectory: '$(Build.SourcesDirectory)/OpenShiftDeployment'
+      env:
+        BUILDID: $(Build.BuildId)
+    - task: CopyFiles@2
+      displayName: Prepare Deployment Scripts
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)/OpenShiftDeployment'
+        Contents: '**'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/OpenShiftDeployment'
+        CleanTargetFolder: true
+        OverWrite: true
+    - task: Bash@3
+      displayName: Docker Login, Build and Push
+      inputs:
+        targetType: 'inline'
+        script: |
+          docker login --username $REGISTRY_USERNAME --password $REGISTRY_PASSWORD $REGISTRY_HOSTNAME
+          docker build . -t $REGISTRY_HOSTNAME/openshifttestapp:$BUILDID
+          docker push $REGISTRY_HOSTNAME/openshifttestapp:$BUILDID
+        workingDirectory: '$(Build.SourcesDirectory)'
+      env:
+        REGISTRY_USERNAME: $(REGISTRY_USERNAME)
+        REGISTRY_PASSWORD: $(REGISTRY_PASSWORD)
+        REGISTRY_HOSTNAME: $(REGISTRY_HOSTNAME)
+        BUILDID: $(Build.BuildId)
+    - task: Bash@3
+      displayName: Install EF
+      inputs:
+        targetType: 'inline'
+        script: |
+          dotnet tool install --global dotnet-ef --version 3.0.0
+    - task: Bash@3
+      displayName: Creating migrations script
+      inputs:
+        targetType: 'inline'
+        script: |
+          ~/.dotnet/tools/dotnet-ef migrations script --idempotent --project $BIULDSOURCEDIR/OpenShiftTestApp.csproj --startup-project $BIULDSOURCEDIR/OpenShiftTestApp.csproj --output $BIULDARTIFACTDIR/build_migrations/$DATABASENAME.sql --context $DATABASENAME --verbose
+      env:
+        DATABASENAME: $(DATABASENAME)
+        BIULDSOURCEDIR: $(Build.SourcesDirectory)
+        BIULDARTIFACTDIR: $(Build.ArtifactStagingDirectory)
+    - task: PublishBuildArtifacts@1
+      displayName: Upload artifact
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+- stage: Deploy
+  jobs:
+  - deployment: DeployOpenShift
+    pool:
+      vmImage: 'vs2017-win2016'
+    environment: 
+      name: TestOpenshiftCluster
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none
+          - task: DownloadBuildArtifacts@0
+            displayName: Downloading Build Artifacts
+            inputs:
+              artifactName: 'drop'
+              buildType: 'current'
+              downloadType: 'single'
+              downloadPath: '$(System.ArtifactsDirectory)'
+          - task: Bash@3
+            displayName: Setup Env
+            inputs:
+              targetType: 'inline'
+              script: |
+                sed -i "s/#{Deployment.CONNECTIONSTRING}#/$(echo -n $CONNECTIONSTRING|base64 -w0)/g" secret.yaml
+                sed -i "s/#{Deployment.DATABASEPASSWORD}#/$(echo -n $DATABASEPASSWORD|base64 -w0)/g" secret.yaml
+                sed -i "s/#{Deployment.REGISTRY_HOSTNAME}#/$REGISTRY_HOSTNAME/g" deployment.yaml
+                sed -i "s/#{Deployment.REGISTRY_HOSTNAME}#/$REGISTRY_HOSTNAME/g" dockerconfig.json
+                sed -i "s/#{Deployment.REGISTRY_USERNAME}#/$REGISTRY_USERNAME/g" dockerconfig.json
+                sed -i "s/#{Deployment.REGISTRY_PASSWORD}#/$(echo "$REGISTRY_PASSWORD" | sed 's/\//\\\//g')/g" dockerconfig.json
+                sed -i "s/#{Deployment.REGISTRY_AUTH_BASE64}#/$(echo -n $REGISTRY_USERNAME:$REGISTRY_PASSWORD|base64 -w0)/g" dockerconfig.json
+                sed -i "s/#{Deployment.DOCKERCONFIGJSON}#/$(echo -n $(cat dockerconfig.json | tr -d [:space:])|base64 -w0)/g" secret.yaml
+              workingDirectory: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+            env:
+              CONNECTIONSTRING: $(CONNECTIONSTRING)
+              DATABASEPASSWORD: $(DATABASEPASSWORD)
+              REGISTRY_USERNAME: $(REGISTRY_USERNAME)
+              REGISTRY_PASSWORD: $(REGISTRY_PASSWORD)
+              REGISTRY_HOSTNAME: $(REGISTRY_HOSTNAME)
+          - task: Bash@3
+            displayName: oc-setup (download)
+            inputs:
+              targetType: 'inline'
+              script: |
+                curl -L https://github.com/openshift/origin/releases/download/v3.11.0/openshift-origin-client-tools-v3.11.0-0cbc58b-windows.zip --output openshift.zip
+              workingDirectory: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+          - task: ExtractFiles@1
+            displayName: oc-setup (extract)
+            inputs:
+              archiveFilePatterns: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment/openshift.zip'
+              destinationFolder: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+              cleanDestinationFolder: false
+          - task: Bash@3
+            displayName: oc login
+            inputs:
+              targetType: 'inline'
+              script: |
+                ./oc login --token $OCTOKEN $OCURL
+              workingDirectory: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+            env:
+              OCTOKEN: $(OCTOKEN)
+              OCURL: $(OCURL)
+          - task: Bash@3
+            displayName: oc apply secret
+            inputs:
+              targetType: 'inline'
+              script: |
+                ./oc apply -f secret.yaml
+              workingDirectory: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+          - task: Bash@3
+            displayName: oc apply storage
+            inputs:
+              targetType: 'inline'
+              script: |
+                ./oc apply -f storage.yaml
+              workingDirectory: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+          - task: Bash@3
+            displayName: oc apply deployment
+            inputs:
+              targetType: 'inline'
+              script: |
+                ./oc apply -f deployment.yaml
+                deployment=$(grep -A1 '^metadata:' deployment.yaml | tail -n1); deployment=${deployment//*name: /};
+                echo "##vso[task.setvariable variable=deployment_name;]$deployment"
+                sleep 3
+              workingDirectory: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+          - task: Bash@3
+            displayName: oc rollout status deployment watch
+            inputs:
+              targetType: 'inline'
+              script: |
+                ./oc rollout status deployment/$(deployment_name) --watch
+              workingDirectory: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+          - task: Bash@3
+            displayName: oc apply service
+            inputs:
+              targetType: 'inline'
+              script: |
+                ./oc apply -f service.yaml
+                service=$(grep -A1 '^metadata:' service.yaml | tail -n1); service=${service//*name: /};
+                echo "##vso[task.setvariable variable=database_service_name;]$service"
+              workingDirectory: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+          - task: Bash@3
+            displayName: oc apply route
+            inputs:
+              targetType: 'inline'
+              script: |
+                ./oc apply -f route.yaml
+              workingDirectory: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+          - task: Bash@3
+            displayName: oc await database service settings
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo Awaiting database service IP
+                while true
+                    do
+                        ip=$(./oc get service $(database_service_name) -o jsonpath="{.status.loadBalancer.ingress[0].ip}")
+                        if [ ! -z "$ip" ]
+                            then
+                                echo IP: $ip
+                                echo "##vso[task.setvariable variable=database_service_ip;]$ip"
+                                break;
+                            fi
+                        sleep 2
+                    done
+                
+                echo Awaiting database service Port
+                while true
+                    do
+                        port=$(./oc get service $(database_service_name) -o jsonpath="{.spec.ports[0].port}")
+                        if [ ! -z "$port" ]
+                            then
+                                echo PORT: $port
+                                echo "##vso[task.setvariable variable=database_service_port;]$port"
+                                break;
+                            fi
+                        sleep 2
+                    done
+                sleep 15
+              workingDirectory: '$(Build.ArtifactStagingDirectory)/drop/OpenShiftDeployment'
+          - task: SqlDacpacDeploymentOnMachineGroup@0
+            displayName: creating database if not exists
+            inputs:
+              TaskType: 'sqlInline'
+              InlineSql: |
+                If(db_id(N'$(DATABASENAME)') IS NULL)
+                 BEGIN
+                  CREATE DATABASE [$(DATABASENAME)]
+                 END;
+              ServerName: '$(database_service_ip),$(database_service_port)'
+              DatabaseName: 'master'
+              AuthScheme: 'sqlServerAuthentication'
+              SqlUsername: $(DATABASEUSER)
+              SqlPassword: '$(DATABASEPASSWORD)'
+          - task: SqlDacpacDeploymentOnMachineGroup@0
+            displayName: updating database
+            inputs:
+              TaskType: 'sqlQuery'
+              SqlFile: '$(Build.ArtifactStagingDirectory)\drop\build_migrations\$(DATABASENAME).sql'
+              ServerName: '$(database_service_ip),$(database_service_port)'
+              DatabaseName: '$(DATABASENAME)'
+              AuthScheme: 'sqlServerAuthentication'
+              SqlUsername: $(DATABASEUSER)
+              SqlPassword: '$(DATABASEPASSWORD)'

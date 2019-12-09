@@ -1,0 +1,10 @@
+{
+    "auths": {
+        "#{Deployment.REGISTRY_HOSTNAME}#": {
+            "username": "#{Deployment.REGISTRY_USERNAME}#",
+            "password": "#{Deployment.REGISTRY_PASSWORD}#",
+            "email": "unused",
+            "auth": "#{Deployment.REGISTRY_AUTH_BASE64}#"
+        }
+    }
+}

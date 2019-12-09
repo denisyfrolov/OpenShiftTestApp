@@ -1,0 +1,173 @@
+name: buildAndDeploy
+on: 
+  push:
+    branches: 
+      - master
+env:
+  ARTIFACTS_NAME: drop
+  REGISTRY_HOSTNAME: ${{ secrets.REGISTRY_NAME }}.azurecr.io
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v1
+    - name: Generate build number
+      id: buildnumber
+      uses: einaregilsson/build-number@v2 
+      with:
+        token: ${{secrets.github_token}}
+    - name: Setup Env
+      working-directory: OpenShiftDeployment
+      run: |
+        sed -i "s/#{Build.BuildId}#/$BUILDID/g" deployment.yaml
+      env:
+        BUILDID: github${{ steps.buildnumber.outputs.build_number }}
+    - name: Docker Login, Build and Push
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ env.REGISTRY_HOSTNAME }}
+        username: ${{ secrets.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+    - run: |
+        docker build . -t $REGISTRY_HOSTNAME/openshifttestapp:$BUILDID
+        docker push $REGISTRY_HOSTNAME/openshifttestapp:$BUILDID
+      env:
+        REGISTRY_HOSTNAME: ${{ env.REGISTRY_HOSTNAME }}
+        BUILDID: github${{ steps.buildnumber.outputs.build_number }}
+    - name: Install Dotnet
+      uses: actions/setup-dotnet@v1.0.0
+    - name: Install EF
+      run: |
+        dotnet tool install --global dotnet-ef --version 3.0.0
+    - name: Creating migrations script
+      run: |
+        ~/.dotnet/tools/dotnet-ef migrations script --idempotent --project $BIULDSOURCEDIR/OpenShiftTestApp.csproj --startup-project $BIULDSOURCEDIR/OpenShiftTestApp.csproj --output $BIULDARTIFACTDIR/$MIGRATIONS/$DATABASENAME.sql --context $DATABASENAME --verbose
+      env:
+        DATABASENAME: ${{ secrets.DATABASENAME }}
+        BIULDSOURCEDIR: "."
+        BIULDARTIFACTDIR: "."
+        MIGRATIONS: build_migrations
+    - name: Prepare Artifacts
+      run: |
+        mkdir $ARTIFACTS_FOLDER
+        cp -r OpenShiftDeployment $ARTIFACTS_FOLDER
+        cp -r $MIGRATIONS $ARTIFACTS_FOLDER
+      env:
+        ARTIFACTS_FOLDER: github${{ steps.buildnumber.outputs.build_number }}_${{ env.ARTIFACTS_NAME }}
+        MIGRATIONS: build_migrations
+    - name: Upload artifact
+      uses: actions/upload-artifact@v1.0.0
+      with:
+        name: ${{ env.ARTIFACTS_NAME }}
+        path: github${{ steps.buildnumber.outputs.build_number }}_${{ env.ARTIFACTS_NAME }}
+  deploy:
+    needs: [build]
+    runs-on: [ubuntu-latest]
+    steps:
+      - name: Downloading Build Artifacts
+        uses: actions/download-artifact@v1.0.0
+        with:
+          name: ${{ env.ARTIFACTS_NAME }}
+      - name: Setup Env
+        run: |
+          sed -i "s/#{Deployment.CONNECTIONSTRING}#/$(echo -n $CONNECTIONSTRING|base64 -w0)/g" secret.yaml
+          sed -i "s/#{Deployment.DATABASEPASSWORD}#/$(echo -n $DATABASEPASSWORD|base64 -w0)/g" secret.yaml
+          sed -i "s/#{Deployment.REGISTRY_HOSTNAME}#/$REGISTRY_HOSTNAME/g" deployment.yaml
+          sed -i "s/#{Deployment.REGISTRY_HOSTNAME}#/$REGISTRY_HOSTNAME/g" dockerconfig.json
+          sed -i "s/#{Deployment.REGISTRY_USERNAME}#/$REGISTRY_USERNAME/g" dockerconfig.json
+          sed -i "s/#{Deployment.REGISTRY_PASSWORD}#/$(echo "$REGISTRY_PASSWORD" | sed 's/\//\\\//g')/g" dockerconfig.json
+          sed -i "s/#{Deployment.REGISTRY_AUTH_BASE64}#/$(echo -n $REGISTRY_USERNAME:$REGISTRY_PASSWORD|base64 -w0)/g" dockerconfig.json
+          sed -i "s/#{Deployment.DOCKERCONFIGJSON}#/$(echo -n $(cat dockerconfig.json | tr -d [:space:])|base64 -w0)/g" secret.yaml
+        working-directory: drop/OpenShiftDeployment
+        env:
+          CONNECTIONSTRING: ${{ secrets.CONNECTIONSTRING }}
+          DATABASEPASSWORD: ${{ secrets.DATABASEPASSWORD }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          REGISTRY_HOSTNAME: ${{ env.REGISTRY_HOSTNAME }}
+      - name: oc-setup
+        run: |
+          wget https://github.com/openshift/origin/releases/download/v3.11.0/openshift-origin-client-tools-v3.11.0-0cbc58b-linux-64bit.tar.gz
+          tar -xf openshift-origin-client-tools-v3.11.0-0cbc58b-linux-64bit.tar.gz
+          cp openshift-origin-client-tools-v3.11.0-0cbc58b-linux-64bit/oc .
+          chmod +x oc
+        working-directory: drop/OpenShiftDeployment
+      - name: oc login
+        run: |
+          ./oc login --token $OCTOKEN $OCURL
+        working-directory: drop/OpenShiftDeployment
+        env:
+          OCTOKEN: ${{ secrets.OCTOKEN }}
+          OCURL: ${{ secrets.OCURL }}
+      - name: oc apply secret
+        run: |
+          ./oc apply -f secret.yaml
+        working-directory: drop/OpenShiftDeployment
+      - name: oc apply storage
+        run: |
+          ./oc apply -f storage.yaml
+        working-directory: drop/OpenShiftDeployment
+      - name: oc apply deployment
+        run: |
+          ./oc apply -f deployment.yaml
+          deployment=$(grep -A1 '^metadata:' deployment.yaml | tail -n1); deployment=${deployment//*name: /};
+          echo ::set-env name=deployment_name::$deployment
+          sleep 3
+        working-directory: drop/OpenShiftDeployment
+      - name: oc rollout status deployment watch
+        run: |
+          ./oc rollout status deployment/${{ env.deployment_name }} --watch
+        working-directory: drop/OpenShiftDeployment
+      - name: oc apply service
+        run: |
+          ./oc apply -f service.yaml
+          service=$(grep -A1 '^metadata:' service.yaml | tail -n1); service=${service//*name: /};
+          echo ::set-env name=database_service_name::$service
+        working-directory: drop/OpenShiftDeployment
+      - name: oc apply route
+        run: |
+          ./oc apply -f route.yaml
+        working-directory: drop/OpenShiftDeployment
+      - name: oc await database service settings
+        run: |
+          echo Awaiting database service IP
+                while true
+                    do
+                        ip=$(./oc get service ${{ env.database_service_name }} -o jsonpath="{.status.loadBalancer.ingress[0].ip}")
+                        if [ ! -z "$ip" ]
+                            then
+                                echo IP: $ip
+                                echo ::set-env name=database_service_ip::$ip
+                                break;
+                            fi
+                        sleep 2
+                    done
+                
+                echo Awaiting database service Port
+                while true
+                    do
+                        port=$(./oc get service ${{ env.database_service_name }} -o jsonpath="{.spec.ports[0].port}")
+                        if [ ! -z "$port" ]
+                            then
+                                echo PORT: $port
+                                echo ::set-env name=database_service_port::$port
+                                break;
+                            fi
+                        sleep 2
+                    done
+                sleep 15
+        working-directory: drop/OpenShiftDeployment
+      - name: Installing MSSQL CLI
+        run: |
+          pip install mssql-cli
+      - name: creating database if not exists
+        run: |
+          sqlcmd -S ${{ env.database_service_ip }},${{ env.database_service_port }} -U ${{ secrets.DATABASEUSER }} -P ${{ secrets.DATABASEPASSWORD }} -Q "
+            If(db_id(N'${{ secrets.DATABASENAME }}') IS NULL)
+                   BEGIN
+                    CREATE DATABASE [${{ secrets.DATABASENAME }}]
+                   END;"
+      - name: updating database
+        run: |
+          sqlcmd -S ${{ env.database_service_ip }},${{ env.database_service_port }} -U ${{ secrets.DATABASEUSER }} -P ${{ secrets.DATABASEPASSWORD }} -d ${{ secrets.DATABASENAME }} -i ${{ secrets.DATABASENAME }}.sql
+        working-directory: drop/build_migrations
